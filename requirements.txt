@@ -2,5 +2,6 @@
 openai>=1.0.0
 requests
 PySocks
+socksio
 playwright
 playwright-stealth
