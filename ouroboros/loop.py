@@ -614,8 +614,9 @@ def run_llm_loop(
 
     Returns: (final_text, accumulated_usage, llm_trace)
     """
-    # LLM-first: single default model, LLM switches via tool if needed
-    active_model = llm.default_model()
+    # LLM-first: single default model, LLM switches via tool if needed.
+    # Route to light model for short/simple tasks if OUROBOROS_MODEL_LIGHT is set.
+    active_model = _pick_initial_model(llm, messages)
     active_effort = initial_effort
 
     llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
@@ -716,7 +717,7 @@ def run_llm_loop(
                     ), accumulated_usage, llm_trace
 
                 # Emit progress message so user sees fallback happening
-                fallback_progress = f"⚡ Fallback: {active_model} → {fallback_model} after empty response"
+                fallback_progress = f"⚡ Fallback: {active_model} → {fallback_model}"
                 emit_progress(fallback_progress)
 
                 # Try fallback model (don't increment round_idx — this is still same logical round)
@@ -817,6 +818,44 @@ def _emit_llm_usage_event(
         })
     except Exception:
         log.debug("Failed to put llm_usage event to queue", exc_info=True)
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Detect 429 Too Many Requests errors (rate limit)."""
+    try:
+        status = getattr(e, "status_code", None)
+        if status == 429:
+            return True
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            if getattr(resp, "status_code", None) == 429:
+                return True
+        msg = str(e)
+        if "429" in msg and ("rate" in msg.lower() or "too many" in msg.lower() or "quota" in msg.lower()):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _pick_initial_model(llm: LLMClient, messages: List[Dict[str, Any]]) -> str:
+    """
+    Route to light model for short/simple tasks, default model otherwise.
+    Uses OUROBOROS_MODEL_LIGHT if set. Bible P3: configurable via env.
+    """
+    light_model = str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip()
+    if not light_model:
+        return llm.default_model()
+
+    # Estimate total tokens in messages
+    total_tokens = sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
+
+    # Short task heuristic: < 300 tokens AND no tool result messages
+    has_tool_results = any(m.get("role") == "tool" for m in messages)
+    if total_tokens < 300 and not has_tool_results:
+        return light_model
+
+    return llm.default_model()
 
 
 def _is_payment_required_error(e: Exception) -> bool:
@@ -932,6 +971,16 @@ def _call_llm_with_retry(
             return msg, cost
 
         except Exception as e:
+            # Rate limit (429): don't waste retries — signal fallback immediately.
+            if _is_rate_limit_error(e):
+                append_jsonl(drive_logs / "events.jsonl", {
+                    "ts": utc_now_iso(), "type": "llm_rate_limited",
+                    "task_id": task_id,
+                    "round": round_idx, "attempt": attempt + 1,
+                    "model": model, "error": repr(e),
+                })
+                return None, 0.0
+
             # Terminal: OpenRouter has no credits / payment required. Don't waste retries/fallbacks.
             if _is_payment_required_error(e):
                 append_jsonl(drive_logs / "events.jsonl", {

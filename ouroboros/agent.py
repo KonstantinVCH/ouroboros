@@ -439,6 +439,10 @@ class OuroborosAgent:
             if not isinstance(text, str) or not text.strip():
                 text = "⚠️ Model returned an empty response. Try rephrasing your request."
 
+            # Auto-write brief summary to scratchpad after each significant task
+            if task_type_str not in ("evolution", "consciousness") and text and not text.startswith("⚠️"):
+                self._append_scratchpad_summary(task, text, usage)
+
             # Emit events for supervisor
             self._emit_task_results(task, text, usage, llm_trace, start_time, drive_logs)
             return list(self._pending_events)
@@ -460,6 +464,40 @@ class OuroborosAgent:
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
             self._current_task_type = None
+
+    # =====================================================================
+    # Scratchpad auto-summary
+    # =====================================================================
+
+    def _append_scratchpad_summary(
+        self, task: Dict[str, Any], result_text: str, usage: Dict[str, Any]
+    ) -> None:
+        """Append a brief entry to scratchpad after each completed task."""
+        try:
+            scratchpad_path = self.memory.scratchpad_path()
+            ts = utc_now_iso()[:16].replace("T", " ")
+            task_text = str(task.get("text") or task.get("task") or "")[:120]
+            result_preview = result_text.strip()[:200].replace("\n", " ")
+            rounds = int(usage.get("rounds") or 0)
+            cost = round(float(usage.get("cost") or 0), 5)
+            entry = (
+                f"\n## {ts}\n"
+                f"**Task:** {task_text}\n"
+                f"**Result:** {result_preview}\n"
+                f"**Rounds:** {rounds}, cost: ${cost}\n"
+            )
+            current = self.memory.load_scratchpad()
+            # Keep scratchpad from growing unbounded: trim if > 8000 chars
+            if len(current) > 8000:
+                # Keep header + last 6000 chars
+                header_end = current.find("\n\n## ")
+                if header_end > 0:
+                    current = current[:header_end] + current[header_end:][-6000:]
+                else:
+                    current = current[-6000:]
+            self.memory.save_scratchpad(current + entry)
+        except Exception:
+            log.debug("Failed to append scratchpad summary", exc_info=True)
 
     # =====================================================================
     # Task result emission
