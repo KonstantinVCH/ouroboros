@@ -136,6 +136,89 @@ Open your Telegram bot and send any message. The first person to write becomes t
 
 ---
 
+## Local Quick Start (Windows/macOS/Linux)
+
+This repo is the original **Colab/Telegram** runtime, but you can also run it locally via `local_launcher.py`.
+
+### Prerequisites
+
+- Python **3.10+**
+- Git installed and available in PATH
+- A Telegram bot token (see above)
+- API keys / tokens:
+  - `OPENROUTER_API_KEY` (required)
+  - `TELEGRAM_BOT_TOKEN` (required)
+  - `TOTAL_BUDGET` (required)
+  - `GITHUB_TOKEN` (required, `repo` scope)
+  - `GITHUB_USER` + `GITHUB_REPO` (your fork)
+
+### Install (example: Windows PowerShell)
+
+```powershell
+cd C:\path\to\ouroboros
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+pip install -r requirements.txt
+python -m playwright install
+```
+
+### Configure env vars (example: Windows PowerShell)
+
+```powershell
+$env:OPENROUTER_API_KEY="..."
+$env:TELEGRAM_BOT_TOKEN="..."
+$env:TOTAL_BUDGET="50"
+$env:GITHUB_TOKEN="..."
+$env:GITHUB_USER="YOUR_GITHUB_USERNAME"
+$env:GITHUB_REPO="YOUR_FORK_REPO_NAME"
+```
+
+### Run
+
+```powershell
+python .\local_launcher.py
+```
+
+Notes:
+- Runtime data is stored under `OUROBOROS_RUNTIME_ROOT` (default: `~/.ouroboros/Ouroboros`).
+- `local_launcher.py` will clone your fork into the runtime directory and create the `ouroboros` / `ouroboros-stable` branches on first run (fresh forks only have `main`).
+- The first Telegram user to message the bot becomes the owner.
+
+### Free local LLM via Ollama (recommended)
+
+If you want to run without OpenRouter credits, use a local model through **Ollama** (OpenAI-compatible endpoint).
+
+1) Install Ollama and pull a model:
+
+```powershell
+ollama pull llama3.1:8b
+```
+
+2) Create `.env` next to `local_launcher.py` (recommended on Windows):
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TOTAL_BUDGET=0
+GITHUB_TOKEN=...
+GITHUB_USER=YOUR_GITHUB_USERNAME
+GITHUB_REPO=YOUR_FORK_REPO_NAME
+
+OUROBOROS_LLM_BASE_URL=http://localhost:11434/v1
+OUROBOROS_LLM_API_KEY=ollama
+OUROBOROS_MODEL=llama3.1:8b
+OUROBOROS_MODEL_CODE=llama3.1:8b
+
+# background consciousness OFF by default; enable if you want
+OUROBOROS_BG_AUTO_START=0
+```
+
+3) Run:
+
+```powershell
+python .\local_launcher.py
+```
+
 ## Telegram Bot Commands
 
 | Command | Description |

@@ -16,6 +16,14 @@ log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
 
+def _env_llm_base_url() -> str:
+    return str(os.environ.get("OUROBOROS_LLM_BASE_URL") or "").strip()
+
+
+def _is_openrouter_base_url(base_url: str) -> bool:
+    b = str(base_url or "").lower()
+    return "openrouter.ai" in b
+
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
     allowed = {"none", "minimal", "low", "medium", "high", "xhigh"}
@@ -50,6 +58,11 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
         import requests
     except ImportError:
         log.warning("requests not installed, cannot fetch pricing")
+        return {}
+
+    # If the runtime is pointed at a local LLM (Ollama/LM Studio/etc),
+    # don't spam OpenRouter pricing fetches.
+    if _env_llm_base_url() and not _is_openrouter_base_url(_env_llm_base_url()):
         return {}
 
     try:
@@ -103,28 +116,32 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """LLM API wrapper. Defaults to OpenRouter; can be overridden to local OpenAI-compatible endpoints (e.g. Ollama)."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: str = "https://openrouter.ai/api/v1",
     ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
+        env_base = _env_llm_base_url()
+        self._base_url = env_base or base_url
+        # Prefer explicit override for local endpoints; fall back to OpenRouter key.
+        self._api_key = (
+            api_key
+            or os.environ.get("OUROBOROS_LLM_API_KEY", "")
+            or os.environ.get("OPENROUTER_API_KEY", "")
+            or "ollama"
+        )
         self._client = None
 
     def _get_client(self):
         if self._client is None:
             from openai import OpenAI
-            self._client = OpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
-                default_headers={
-                    "HTTP-Referer": "https://colab.research.google.com/",
-                    "X-Title": "Ouroboros",
-                },
-            )
+            headers = {"X-Title": "Ouroboros"}
+            # OpenRouter expects referer/title; local endpoints don't care.
+            if _is_openrouter_base_url(self._base_url):
+                headers["HTTP-Referer"] = "https://colab.research.google.com/"
+            self._client = OpenAI(base_url=self._base_url, api_key=self._api_key, default_headers=headers)
         return self._client
 
     def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
@@ -164,12 +181,13 @@ class LLMClient:
         client = self._get_client()
         effort = normalize_reasoning_effort(reasoning_effort)
 
-        extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
-        }
+        extra_body: Dict[str, Any] = {}
+        if _is_openrouter_base_url(self._base_url):
+            # OpenRouter supports this knob; some local servers may reject unknown fields.
+            extra_body = {"reasoning": {"effort": effort, "exclude": True}}
 
         # Pin Anthropic models to Anthropic provider for prompt caching
-        if model.startswith("anthropic/"):
+        if _is_openrouter_base_url(self._base_url) and model.startswith("anthropic/"):
             extra_body["provider"] = {
                 "order": ["Anthropic"],
                 "allow_fallbacks": False,
@@ -180,17 +198,20 @@ class LLMClient:
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "extra_body": extra_body,
         }
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         if tools:
-            # Add cache_control to last tool for Anthropic prompt caching
-            # This caches all tool schemas (they never change between calls)
-            tools_with_cache = [t for t in tools]  # shallow copy
-            if tools_with_cache:
-                last_tool = {**tools_with_cache[-1]}  # copy last tool
-                last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-                tools_with_cache[-1] = last_tool
-            kwargs["tools"] = tools_with_cache
+            # OpenRouter/Anthropic supports tool schema caching. Local endpoints may reject unknown fields.
+            if _is_openrouter_base_url(self._base_url):
+                tools_with_cache = [t for t in tools]  # shallow copy
+                if tools_with_cache:
+                    last_tool = {**tools_with_cache[-1]}  # copy last tool
+                    last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+                    tools_with_cache[-1] = last_tool
+                kwargs["tools"] = tools_with_cache
+            else:
+                kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
 
         resp = client.chat.completions.create(**kwargs)

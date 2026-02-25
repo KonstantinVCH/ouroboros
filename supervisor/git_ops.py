@@ -55,7 +55,8 @@ def git_capture(cmd: List[str]) -> Tuple[int, str, str]:
 
 def ensure_repo_present() -> None:
     if not (REPO_DIR / ".git").exists():
-        subprocess.run(["rm", "-rf", str(REPO_DIR)], check=False)
+        # Cross-platform remove (Windows doesn't have `rm`).
+        shutil.rmtree(REPO_DIR, ignore_errors=True)
         subprocess.run(["git", "clone", REMOTE_URL, str(REPO_DIR)], check=True)
     else:
         subprocess.run(["git", "remote", "set-url", "origin", REMOTE_URL],
@@ -300,8 +301,20 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         )
         return False, msg
 
-    subprocess.run(["git", "checkout", branch], cwd=str(REPO_DIR), check=True)
-    subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], cwd=str(REPO_DIR), check=True)
+    # On Windows, `git checkout <branch>` can be ambiguous when a path matches the name
+    # (e.g. folder `ouroboros/` and branch `ouroboros`). Be explicit about the remote ref.
+    remote_ref = f"refs/remotes/origin/{branch}"
+    # Create/reset local branch to exactly match the remote ref.
+    subprocess.run(["git", "checkout", "-B", branch, remote_ref], cwd=str(REPO_DIR), check=True)
+    # Best-effort: ensure upstream is set (not required for correctness here).
+    subprocess.run(
+        ["git", "branch", "--set-upstream-to", f"origin/{branch}", branch],
+        cwd=str(REPO_DIR),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "reset", "--hard", remote_ref], cwd=str(REPO_DIR), check=True)
     # Clean __pycache__ to prevent stale bytecode (git checkout may not update mtime)
     for p in REPO_DIR.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
@@ -353,7 +366,7 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
 
 def import_test() -> Dict[str, Any]:
     r = subprocess.run(
-        ["python3", "-c", "import ouroboros, ouroboros.agent; print('import_ok')"],
+        [sys.executable, "-c", "import ouroboros, ouroboros.agent; print('import_ok')"],
         cwd=str(REPO_DIR),
         capture_output=True, text=True,
     )

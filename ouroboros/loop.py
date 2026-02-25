@@ -819,6 +819,29 @@ def _emit_llm_usage_event(
         log.debug("Failed to put llm_usage event to queue", exc_info=True)
 
 
+def _is_payment_required_error(e: Exception) -> bool:
+    """
+    Best-effort detection of OpenRouter 402 errors.
+    We avoid importing provider-specific exception classes; instead we use duck-typing / string match.
+    """
+    try:
+        # openai-python APIStatusError often exposes status_code
+        status = getattr(e, "status_code", None)
+        if status == 402:
+            return True
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            resp_status = getattr(resp, "status_code", None)
+            if resp_status == 402:
+                return True
+        msg = str(e)
+        if "402" in msg and "Payment Required" in msg:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _call_llm_with_retry(
     llm: LLMClient,
     messages: List[Dict[str, Any]],
@@ -909,6 +932,24 @@ def _call_llm_with_retry(
             return msg, cost
 
         except Exception as e:
+            # Terminal: OpenRouter has no credits / payment required. Don't waste retries/fallbacks.
+            if _is_payment_required_error(e):
+                append_jsonl(drive_logs / "events.jsonl", {
+                    "ts": utc_now_iso(), "type": "llm_payment_required",
+                    "task_id": task_id,
+                    "round": round_idx, "attempt": attempt + 1,
+                    "model": model, "error": repr(e),
+                })
+                friendly = (
+                    "⚠️ OpenRouter вернул **402 Payment Required**.\n\n"
+                    "Это значит: на аккаунте OpenRouter **нет доступных кредитов** (или модель требует оплату).\n"
+                    "Решения:\n"
+                    "- Пополнить баланс на OpenRouter, или\n"
+                    "- Перейти на локальную модель (например Ollama) — это требует доработки этого репо.\n"
+                )
+                # Return a non-empty message so upstream doesn't treat this as an "empty response"
+                return {"role": "assistant", "content": friendly, "tool_calls": []}, 0.0
+
             last_error = e
             append_jsonl(drive_logs / "events.jsonl", {
                 "ts": utc_now_iso(), "type": "llm_api_error",

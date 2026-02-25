@@ -146,7 +146,7 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
                 "ts": evt.get("ts", ""),
             }
             tmp_file = results_dir / f"{task_id}.json.tmp"
-            tmp_file.write_text(json.dumps(result_data, ensure_ascii=False))
+            tmp_file.write_text(json.dumps(result_data, ensure_ascii=False), encoding="utf-8")
             os.rename(tmp_file, result_file)
     except Exception as e:
         log.warning("Failed to store task result in events: %s", e)
