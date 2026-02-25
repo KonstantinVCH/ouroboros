@@ -194,6 +194,10 @@ class LLMClient:
                 "require_parameters": True,
             }
 
+        # Groq free tier rejects requests with max_tokens > 8192
+        if "groq.com" in str(self._base_url).lower() and max_tokens > 8192:
+            max_tokens = 8192
+
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
