@@ -139,7 +139,33 @@ def _get_chat_agent():
     return _chat_agent
 
 
+_THINKING_MESSAGES = [
+    (10,  "🤔 Думаю над этим вопросом..."),
+    (30,  "⚙️ Всё ещё работаю, задача требует времени..."),
+    (60,  "⏳ Продолжаю обработку, почти готово..."),
+    (120, "🔄 Задача сложная, работаю над ней..."),
+]
+
+
+def _thinking_notifier(chat_id: int, done_event: threading.Event) -> None:
+    """Send periodic 'thinking' messages while the agent is busy."""
+    start = time.time()
+    sent = set()
+    while not done_event.wait(timeout=2.0):
+        elapsed = time.time() - start
+        for delay, msg in _THINKING_MESSAGES:
+            if elapsed >= delay and delay not in sent:
+                sent.add(delay)
+                try:
+                    send_with_budget(chat_id, msg)
+                except Exception:
+                    log.debug("Suppressed thinking notifier exception", exc_info=True)
+
+
 def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None) -> None:
+    done_event = threading.Event()
+    notifier = threading.Thread(target=_thinking_notifier, args=(chat_id, done_event), daemon=True)
+    notifier.start()
     try:
         agent = _get_chat_agent()
         task = {
@@ -181,6 +207,8 @@ def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple
             get_tg().send_message(chat_id, err_msg)
         except Exception:
             log.debug("Suppressed exception", exc_info=True)
+    finally:
+        done_event.set()
 
 
 # ---------------------------------------------------------------------------
