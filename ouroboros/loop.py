@@ -25,6 +25,152 @@ from ouroboros.utils import utc_now_iso, append_jsonl, truncate_for_log, sanitiz
 
 log = logging.getLogger(__name__)
 
+# -----------------------------
+# Zhipu fallback: text tool call protocol
+# -----------------------------
+
+def _is_zhipu_model(model: str) -> bool:
+    m = str(model or "").strip().lower()
+    return m.startswith("zhipu/") or m.startswith("zhipuai/")
+
+
+def _text_tool_protocol_enabled(active_model: str) -> bool:
+    """
+    Enable a JSON-based tool call protocol for providers that don't return native tool_calls.
+
+    Controlled by env:
+      - OUROBOROS_TEXT_TOOL_PROTOCOL=off|0|false  -> disabled
+      - OUROBOROS_TEXT_TOOL_PROTOCOL=on|1|true    -> enabled
+      - OUROBOROS_TEXT_TOOL_PROTOCOL=auto         -> enabled only for Zhipu models
+    """
+    # Default OFF to avoid hardcoded behavior (Bible P3) unless explicitly enabled.
+    mode = str(os.environ.get("OUROBOROS_TEXT_TOOL_PROTOCOL", "off") or "").strip().lower()
+    if mode in {"0", "off", "false", "no"}:
+        return False
+    if mode in {"1", "on", "true", "yes"}:
+        return True
+    # default: auto
+    return _is_zhipu_model(active_model)
+
+
+def _maybe_inject_text_tool_protocol(messages: List[Dict[str, Any]], active_model: str) -> None:
+    """
+    If the active model doesn't support native OpenAI tool_calls (common for non-OpenAI endpoints),
+    we provide a JSON-based protocol so the model can still request tool execution.
+    """
+    if not _text_tool_protocol_enabled(active_model):
+        return
+
+    marker = "[TOOL_PROTOCOL_JSON_V1]"
+    for m in messages:
+        if m.get("role") == "system" and marker in str(m.get("content") or ""):
+            return
+
+    messages.append({
+        "role": "system",
+        "content": (
+            f"{marker}\n"
+            "You are running inside an agent loop with tools.\n"
+            "When the user asks anything that requires reading/modifying the repo, running commands, web searching, or checking state,\n"
+            "you MUST use tools (do not guess).\n\n"
+            "If you need to use tools, DO NOT describe the action in prose.\n"
+            "Instead, output ONLY a fenced JSON block in this exact shape:\n\n"
+            "```tool_calls\n"
+            "{\"tool_calls\": [{\"name\": \"repo_list\", \"arguments\": {}}]}\n"
+            "```\n\n"
+            "Rules:\n"
+            "- Use only tools that are available in the tool list.\n"
+            "- `arguments` must be a JSON object.\n"
+            "- When you output a tool_calls block, do not include any other text outside the block.\n"
+            "- If you do NOT need tools, respond normally.\n"
+        ),
+    })
+
+
+def _extract_tool_calls_from_text(text: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Parse JSON tool call protocol from model text.
+
+    Accepts blocks like:
+    ```tool_calls
+    {"tool_calls":[{"name":"repo_list","arguments":{}}]}
+    ```
+    """
+    if not text or not isinstance(text, str):
+        return []
+    t = text.strip()
+    if "```" not in t:
+        return []
+
+    blocks = t.split("```")
+    candidates: List[str] = []
+    for i in range(1, len(blocks), 2):
+        blk = blocks[i].strip()
+        if not blk:
+            continue
+        # Strip optional language tag first line
+        lines = blk.splitlines()
+        if len(lines) >= 2 and len(lines[0]) <= 24 and all(ch.isalnum() or ch in ("_", "-") for ch in lines[0].strip()):
+            lang = lines[0].strip().lower()
+            if lang in ("json", "tool_calls", "tool", "tools"):
+                blk = "\n".join(lines[1:]).strip()
+        candidates.append(blk)
+
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+
+        tool_calls_raw = None
+        if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
+            tool_calls_raw = obj["tool_calls"]
+        elif isinstance(obj, dict) and isinstance(obj.get("tool"), str):
+            tool_calls_raw = [{"name": obj.get("tool"), "arguments": obj.get("arguments") or {}}]
+
+        if not tool_calls_raw:
+            continue
+
+        out: List[Dict[str, Any]] = []
+        for idx, tc in enumerate(tool_calls_raw):
+            if not isinstance(tc, dict):
+                continue
+            name = str(tc.get("name") or tc.get("tool") or "").strip()
+            args = tc.get("arguments", {})
+            if not name:
+                continue
+            try:
+                args_str = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
+            except Exception:
+                args_str = "{}"
+            out.append({
+                "id": str(tc.get("id") or f"text_tc_{idx}"),
+                "type": "function",
+                "function": {"name": name, "arguments": args_str},
+            })
+        if out:
+            return out
+
+    return []
+
+
+def _looks_like_misformatted_tool_use(text: Optional[str]) -> bool:
+    """Heuristic: model tried to run tools by printing code/thoughts instead of tool_calls JSON."""
+    if not text or not isinstance(text, str):
+        return False
+    t = text.lower()
+    # Common leakage patterns
+    if "```python" not in t and "<think" not in t and "</think" not in t:
+        return False
+    # Looks like tool invocations embedded in code / narration
+    needles = (
+        "drive_read(", "drive_write(", "drive_list(",
+        "repo_read(", "repo_list(", "repo_write(", "repo_edit(",
+        "shell(", "web_search(", "browse_page(", "browser_action(",
+        "switch_model(", "enable_tools(", "list_available_tools(",
+    )
+    return any(n in t for n in needles)
+
 # Pricing from OpenRouter API (2026-02-17). Update periodically via /api/v1/models.
 _MODEL_PRICING_STATIC = {
     "anthropic/claude-opus-4.6": (5.0, 0.5, 25.0),
@@ -643,6 +789,7 @@ def run_llm_loop(
         MAX_ROUNDS = 200
         log.warning("Invalid OUROBOROS_MAX_ROUNDS, defaulting to 200")
     round_idx = 0
+    bad_tool_format_count = 0
     try:
         while True:
             round_idx += 1
@@ -691,6 +838,9 @@ def run_llm_loop(
                 if len(messages) > 60:
                     messages = compact_tool_history(messages, keep_recent=6)
 
+            # If using a model without native tool_calls (e.g. Zhipu), inject a JSON protocol.
+            _maybe_inject_text_tool_protocol(messages, active_model)
+
             # --- LLM call with retry ---
             msg, cost = _call_llm_with_retry(
                 llm, messages, active_model, tool_schemas, active_effort,
@@ -738,8 +888,47 @@ def run_llm_loop(
 
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
+
+            # Some providers may not return native tool_calls.
+            # If enabled, try to parse JSON-based tool call protocol from text.
+            if _text_tool_protocol_enabled(active_model) and (not tool_calls) and content:
+                extracted = _extract_tool_calls_from_text(content)
+                if extracted:
+                    tool_calls = extracted
+                    # Avoid double-sending the JSON blob to the user as assistant text
+                    content = ""
+
             # No tool calls — final response
             if not tool_calls:
+                # If text tool protocol is enabled and the model "leaks" code/thoughts instead of tool_calls,
+                # ask it to correct output format without sending the garbage to the user.
+                if _text_tool_protocol_enabled(active_model) and _looks_like_misformatted_tool_use(content):
+                    bad_tool_format_count += 1
+                    append_jsonl(drive_logs / "events.jsonl", {
+                        "ts": utc_now_iso(),
+                        "type": "llm_bad_tool_format",
+                        "task_id": task_id,
+                        "round": round_idx,
+                        "model": active_model,
+                        "count": bad_tool_format_count,
+                        "preview": truncate_for_log(str(content or ""), 400),
+                    })
+                    if bad_tool_format_count <= 2:
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "Your previous message was NOT a valid tool invocation.\n"
+                                "Do NOT output <think> blocks or ```python code.\n"
+                                "If you need tools, output ONLY a ```tool_calls JSON block as specified.\n"
+                                "Now retry with correct tool_calls output."
+                            ),
+                        })
+                        continue
+                    return (
+                        "⚠️ Модель несколько раз подряд попыталась вызвать инструменты в неверном формате. "
+                        "Попробуйте переформулировать запрос короче и явно попросить: «используй инструменты»."
+                    ), accumulated_usage, llm_trace
+
                 return _handle_text_response(content, llm_trace, accumulated_usage)
 
             # Process tool calls
@@ -989,15 +1178,8 @@ def _call_llm_with_retry(
                     "round": round_idx, "attempt": attempt + 1,
                     "model": model, "error": repr(e),
                 })
-                friendly = (
-                    "⚠️ OpenRouter вернул **402 Payment Required**.\n\n"
-                    "Это значит: на аккаунте OpenRouter **нет доступных кредитов** (или модель требует оплату).\n"
-                    "Решения:\n"
-                    "- Пополнить баланс на OpenRouter, или\n"
-                    "- Перейти на локальную модель (например Ollama) — это требует доработки этого репо.\n"
-                )
-                # Return a non-empty message so upstream doesn't treat this as an "empty response"
-                return {"role": "assistant", "content": friendly, "tool_calls": []}, 0.0
+                # Trigger model fallback upstream (e.g. to a free model, local model, or Zhipu).
+                return None, 0.0
 
             last_error = e
             append_jsonl(drive_logs / "events.jsonl", {
