@@ -1,59 +1,88 @@
-"""QA Bot — thin LLM client using OpenRouter (free models)."""
-from __future__ import annotations
-import httpx
-from .config import get_config
+"""QA Bot — LLM client using OpenRouter free models with fallback."""
 
+import os
+import time
+import logging
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Free models in priority order (OpenRouter free tier)
 FREE_MODELS = [
-    "meta-llama/llama-3.1-8b-instruct:free",
     "google/gemini-2.0-flash-exp:free",
-    "mistralai/mistral-7b-instruct:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "microsoft/phi-3-mini-128k-instruct:free",
+    "qwen/qwen-2-7b-instruct:free",
 ]
 
-SYSTEM_PROMPT = """Ты — опытный QA-инженер и ментор. Ты помогаешь тестировщикам:
-- генерировать тест-кейсы из требований
-- объяснять концепции тестирования
-- разбирать ошибки и баги
-- готовиться к собеседованиям по QA
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-Отвечай чётко, структурировано, с примерами. Используй markdown для форматирования."""
+# QA Bot system prompt — short, focused, professional
+QA_SYSTEM_PROMPT = """Ты — опытный QA-инженер и ментор. Отвечаешь на русском языке.
+
+Твои специализации:
+- Написание тест-кейсов (ручное и автоматизированное тестирование)
+- Тест-планирование и стратегии тестирования
+- API-тестирование (Postman, REST, GraphQL)
+- UI-автоматизация (Selenium, Playwright, Cypress, Appium)
+- Мобильное тестирование (iOS, Android)
+- Баг-репорты и работа с Jira
+- Теория тестирования (виды тестов, пирамида тестирования, SDLC)
+
+Стиль ответов:
+- Конкретно и по делу
+- С примерами кода когда уместно
+- Без лишней воды
+- Используй markdown для форматирования"""
 
 
-async def ask_llm(prompt: str, system: str = SYSTEM_PROMPT, max_tokens: int = 1500) -> str:
-    """Send prompt to LLM via OpenRouter, try free models in order."""
-    cfg = get_config()
-    if not cfg.openrouter_key:
-        return "⚠️ LLM не настроен: задай QA_BOT_OPENROUTER_KEY."
+def ask_llm(messages: list[dict], system: str = QA_SYSTEM_PROMPT,
+            max_tokens: int = 1500) -> str:
+    """Send messages to LLM with automatic fallback through free models."""
+    if not OPENROUTER_API_KEY:
+        return "❌ OPENROUTER_API_KEY не задан. Добавьте ключ в переменные окружения."
 
-    headers = {
-        "Authorization": f"Bearer {cfg.openrouter_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/ouroboros-ai/ouroboros",
-        "X-Title": "QA Mentor Bot",
-    }
-    payload: dict = {
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.7,
-    }
-    models = [cfg.model] + [m for m in FREE_MODELS if m != cfg.model]
+    full_messages = [{"role": "system", "content": system}] + messages
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        for model in models:
-            try:
-                payload["model"] = model
-                resp = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
+    for model in FREE_MODELS:
+        try:
+            resp = requests.post(
+                OPENROUTER_API_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://github.com/ouroboros-ai",
+                    "X-Title": "QA-Bot",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": full_messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.7,
+                },
+                timeout=30,
+            )
+            if resp.status_code == 200:
                 data = resp.json()
-                text = data["choices"][0]["message"]["content"].strip()
-                if text:
-                    return text
-            except Exception:
-                continue
+                content = data["choices"][0]["message"]["content"]
+                if content and len(content.strip()) > 10:
+                    logger.info("LLM response from model: %s", model)
+                    return content.strip()
+        except requests.Timeout:
+            logger.warning("Timeout from model %s, trying next", model)
+        except Exception as exc:
+            logger.warning("Error from model %s: %s", model, exc)
+        time.sleep(0.5)
 
-    return "⚠️ Не удалось получить ответ от LLM. Попробуй позже."
+    return "⚠️ Все модели временно недоступны. Попробуйте через минуту."
+
+
+def ask_with_context(user_text: str, history: list[dict] | None = None) -> str:
+    """Ask LLM with optional conversation history."""
+    messages = history or []
+    messages = messages[-6:]  # Keep last 6 turns for context
+    messages.append({"role": "user", "content": user_text})
+    return ask_llm(messages)
