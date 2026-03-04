@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import queue
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -112,15 +113,23 @@ def _extract_tool_calls_from_text(text: Optional[str]) -> List[Dict[str, Any]]:
         lines = blk.splitlines()
         if len(lines) >= 2 and len(lines[0]) <= 24 and all(ch.isalnum() or ch in ("_", "-") for ch in lines[0].strip()):
             lang = lines[0].strip().lower()
-            if lang in ("json", "tool_calls", "tool", "tools"):
+            # Some models ignore the requested fence and wrap JSON as ```python.
+            if lang in ("json", "tool_calls", "tool", "tools", "python"):
                 blk = "\n".join(lines[1:]).strip()
         candidates.append(blk)
 
     for cand in candidates:
+        cand_s = cand.strip()
         try:
-            obj = json.loads(cand)
+            obj = json.loads(cand_s)
         except Exception:
-            continue
+            # Best-effort repair for common JSON mistakes in tool_calls blocks
+            # (trailing commas like ",]" or ",}" or an extra comma after the last item).
+            try:
+                repaired = re.sub(r",\s*([\]}])", r"\1", cand_s)
+                obj = json.loads(repaired)
+            except Exception:
+                continue
 
         tool_calls_raw = None
         if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
@@ -159,9 +168,18 @@ def _looks_like_misformatted_tool_use(text: Optional[str]) -> bool:
     if not text or not isinstance(text, str):
         return False
     t = text.lower()
-    # Common leakage patterns
-    if "```python" not in t and "<think" not in t and "</think" not in t:
+    # Common leakage patterns. Also treat "tool_calls" code fences as a tool attempt even without python/thought tags.
+    if (
+        "```python" not in t
+        and "<think" not in t
+        and "</think" not in t
+        and ("```" not in t or "tool_calls" not in t)
+    ):
         return False
+
+    # If the model produced a tool_calls block (even malformed), that is a tool attempt.
+    if "tool_calls" in t and "```" in t:
+        return True
     # Looks like tool invocations embedded in code / narration
     needles = (
         "drive_read(", "drive_write(", "drive_list(",
@@ -657,15 +675,17 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
 
     def _handle_enable_tools(ctx=None, tools: str = "", **kwargs):
         names = [n.strip() for n in tools.split(",") if n.strip()]
+        already_in_schemas = {t.get("function", t).get("name") for t in tool_schemas}
         enabled, not_found = [], []
         for name in names:
             schema = tools_registry.get_schema_by_name(name)
-            if schema and name not in enabled_extra:
+            if name in enabled_extra or name in already_in_schemas:
+                enabled.append(f"{name} (already active)")
+            elif schema:
                 tool_schemas.append(schema)
                 enabled_extra.add(name)
+                already_in_schemas.add(name)
                 enabled.append(name)
-            elif name in enabled_extra:
-                enabled.append(f"{name} (already active)")
             else:
                 not_found.append(name)
         parts = []
@@ -1097,6 +1117,14 @@ def _call_llm_with_retry(
     for attempt in range(max_retries):
         try:
             kwargs = {"messages": messages, "model": model, "reasoning_effort": effort}
+            # Optional safety cap to prevent huge, spammy replies (especially on Zhipu).
+            # If unset, llm.chat() default applies.
+            raw_cap = str(os.environ.get("OUROBOROS_MAX_COMPLETION_TOKENS", "") or "").strip()
+            if raw_cap:
+                try:
+                    kwargs["max_tokens"] = max(64, int(raw_cap))
+                except Exception:
+                    pass
             if tools:
                 kwargs["tools"] = tools
             resp_msg, usage = llm.chat(**kwargs)

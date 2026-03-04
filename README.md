@@ -287,6 +287,7 @@ Full text: [BIBLE.md](BIBLE.md)
 | `OUROBOROS_BG_BUDGET_PCT` | `10` | Percentage of total budget allocated to background consciousness |
 | `OUROBOROS_MAX_ROUNDS` | `200` | Maximum LLM rounds per task |
 | `OUROBOROS_MODEL_FALLBACK_LIST` | `google/gemini-2.5-pro-preview,openai/o3,anthropic/claude-sonnet-4.6` | Fallback model chain for empty responses |
+| `OUROBOROS_ZHIPU_API_KEY` | *(empty)* | Zhipu AI API key (used when a model id starts with `zhipu/`, e.g. `zhipu/glm-4`) |
 
 ---
 

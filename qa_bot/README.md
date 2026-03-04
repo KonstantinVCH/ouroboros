@@ -18,7 +18,7 @@
 ### 1. Установка зависимостей
 
 ```bash
-pip install python-telegram-bot requests
+pip install python-telegram-bot requests zhipuai
 ```
 
 ### 2. Создание бота
@@ -28,10 +28,18 @@ pip install python-telegram-bot requests
 3. Дайте боту имя и username (например, `@MyQABot`)
 4. Скопируйте полученный токен
 
-### 3. Получение бесплатного OpenRouter ключа
+### 3. Получение ключа LLM (OpenRouter и/или Zhipu AI)
+
+#### Вариант A: OpenRouter (как было)
 
 1. Зарегистрируйтесь на [openrouter.ai](https://openrouter.ai/)
 2. Создайте API-ключ (есть бесплатный лимит)
+3. Скопируйте ключ
+
+#### Вариант B: Zhipu AI (ChatGLM)
+
+1. Зарегистрируйтесь на [open.bigmodel.cn](https://open.bigmodel.cn/)
+2. Создайте API key
 3. Скопируйте ключ
 
 ### 4. Запуск
@@ -39,7 +47,15 @@ pip install python-telegram-bot requests
 ```bash
 # Установите переменные окружения
 export QA_BOT_TOKEN="ваш_токен_от_BotFather"
+
+# Можно использовать OpenRouter:
 export OPENROUTER_API_KEY="ваш_ключ_от_openrouter"
+
+# И/или Zhipu AI (ChatGLM):
+export ZHIPUAI_API_KEY="ваш_ключ_от_zhipu"
+
+# (опционально) цепочка fallback-моделей Zhipu, по умолчанию: glm-4,glm-4-flash
+export QA_BOT_ZHIPU_MODELS="glm-4,glm-4-flash"
 
 # Запустите бота
 python -m qa_bot.bot
@@ -49,6 +65,8 @@ python -m qa_bot.bot
 ```cmd
 set QA_BOT_TOKEN=ваш_токен_от_BotFather
 set OPENROUTER_API_KEY=ваш_ключ_от_openrouter
+set ZHIPUAI_API_KEY=ваш_ключ_от_zhipu
+set QA_BOT_ZHIPU_MODELS=glm-4,glm-4-flash
 python -m qa_bot\bot.py
 ```
 
@@ -89,6 +107,13 @@ qa_bot/
 4. `qwen/qwen-2-7b-instruct:free`
 
 Если одна модель недоступна — автоматически переключается на следующую.
+
+### Fallback на Zhipu AI (ChatGLM)
+
+Если все бесплатные модели OpenRouter недоступны (лимит/квота/ошибка провайдера), бот автоматически попробует Zhipu AI,
+если задан `ZHIPUAI_API_KEY` (или `QA_BOT_ZHIPU_API_KEY`).
+
+Цепочку моделей Zhipu можно настроить через `QA_BOT_ZHIPU_MODELS` (по умолчанию: `glm-4,glm-4-flash`).
 
 ## Монетизация
 

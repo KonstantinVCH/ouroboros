@@ -5,3 +5,5 @@ PySocks
 socksio
 playwright
 playwright-stealth
+python-telegram-bot
+zhipuai
