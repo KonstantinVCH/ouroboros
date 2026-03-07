@@ -71,7 +71,7 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "") -> str:
     try:
         res = subprocess.run(
             cmd, cwd=str(work_dir),
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=120, encoding='utf-8',
         )
         out = res.stdout + ("\n--- STDERR ---\n" + res.stderr if res.stderr else "")
         if len(out) > 50000:
@@ -101,7 +101,7 @@ def _run_claude_cli(work_dir: str, prompt: str, env: dict) -> subprocess.Complet
 
     res = subprocess.run(
         primary_cmd, cwd=work_dir,
-        capture_output=True, text=True, timeout=300, env=env,
+        capture_output=True, text=True, timeout=300, env=env, encoding='utf-8',
     )
 
     if res.returncode != 0:
@@ -111,7 +111,7 @@ def _run_claude_cli(work_dir: str, prompt: str, env: dict) -> subprocess.Complet
         ):
             res = subprocess.run(
                 legacy_cmd, cwd=work_dir,
-                capture_output=True, text=True, timeout=300, env=env,
+                capture_output=True, text=True, timeout=300, env=env, encoding='utf-8',
             )
 
     return res
@@ -126,6 +126,7 @@ def _check_uncommitted_changes(repo_dir: pathlib.Path) -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            encoding='utf-8',
         )
         if status_res.returncode == 0 and status_res.stdout.strip():
             diff_res = subprocess.run(
@@ -134,6 +135,7 @@ def _check_uncommitted_changes(repo_dir: pathlib.Path) -> str:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                encoding='utf-8',
             )
             if diff_res.returncode == 0 and diff_res.stdout.strip():
                 return (

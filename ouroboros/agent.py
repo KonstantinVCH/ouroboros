@@ -145,7 +145,7 @@ class OuroborosAgent:
             result = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=str(self.env.repo_dir),
-                capture_output=True, text=True, timeout=10, check=True
+                capture_output=True, text=True, timeout=10, check=True, encoding='utf-8'
             )
             dirty_files = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
             if dirty_files:
@@ -229,7 +229,7 @@ class OuroborosAgent:
             result = subprocess.run(
                 ["git", "describe", "--tags", "--abbrev=0"],
                 cwd=str(self.env.repo_dir),
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10, encoding='utf-8'
             )
             if result.returncode != 0:
                 result_data["status"] = "warning"

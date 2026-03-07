@@ -75,7 +75,8 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
             cwd=ctx.repo_dir,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            encoding='utf-8',
         )
         if result.returncode == 0:
             return None

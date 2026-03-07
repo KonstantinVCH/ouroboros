@@ -204,6 +204,7 @@ def _git(args: list[str], timeout: int = 15) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            encoding='utf-8',
         )
         return r.stdout if r.returncode == 0 else ""
     except Exception as e:

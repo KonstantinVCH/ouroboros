@@ -167,7 +167,7 @@ def estimate_tokens(text: str) -> int:
 # ---------------------------------------------------------------------------
 
 def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
-    res = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, encoding='utf-8')
     if res.returncode != 0:
         raise RuntimeError(
             f"Command failed: {' '.join(cmd)}\n\nSTDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}"
@@ -186,7 +186,7 @@ def get_git_info(repo_dir: pathlib.Path) -> tuple[str, str]:
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=2,
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=2, encoding='utf-8',
         )
         if r.returncode == 0:
             branch = r.stdout.strip()
@@ -196,7 +196,7 @@ def get_git_info(repo_dir: pathlib.Path) -> tuple[str, str]:
     try:
         r = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=2,
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=2, encoding='utf-8',
         )
         if r.returncode == 0:
             sha = r.stdout.strip()

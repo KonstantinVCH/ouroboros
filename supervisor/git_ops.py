@@ -49,7 +49,7 @@ def init(repo_dir: pathlib.Path, drive_root: pathlib.Path, remote_url: str,
 # ---------------------------------------------------------------------------
 
 def git_capture(cmd: List[str]) -> Tuple[int, str, str]:
-    r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True, encoding='utf-8')
     return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
 
 
@@ -65,6 +65,73 @@ def ensure_repo_present() -> None:
     subprocess.run(["git", "config", "user.email", "ouroboros@users.noreply.github.com"],
                     cwd=str(REPO_DIR), check=True)
     subprocess.run(["git", "fetch", "origin"], cwd=str(REPO_DIR), check=True)
+
+
+def _apply_local_overlay(reason: str = "") -> None:
+    """
+    Optional: overlay local (uncommitted) code into the runtime repo after reset.
+
+    This is useful for local development when you don't want to push/commit, but
+    still need workers (which import from REPO_DIR) to see patched code.
+
+    Enabled by env: OUROBOROS_APPLY_LOCAL_OVERLAY=1
+    Source root: defaults to current working directory; can be overridden by OUROBOROS_LOCAL_OVERLAY_ROOT
+    """
+    enabled = str(os.environ.get("OUROBOROS_APPLY_LOCAL_OVERLAY", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return
+
+    src_root_raw = str(os.environ.get("OUROBOROS_LOCAL_OVERLAY_ROOT", "") or "").strip()
+    src_root = pathlib.Path(src_root_raw).expanduser().resolve() if src_root_raw else pathlib.Path.cwd().resolve()
+
+    copies = [
+        (src_root / "ouroboros" / "llm.py", REPO_DIR / "ouroboros" / "llm.py"),
+        (src_root / "ouroboros" / "loop.py", REPO_DIR / "ouroboros" / "loop.py"),
+    ]
+
+    applied: List[str] = []
+    for src, dst in copies:
+        try:
+            if not src.exists() or not src.is_file():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            applied.append(str(dst.relative_to(REPO_DIR)))
+        except Exception as e:
+            append_jsonl(
+                DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {
+                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "type": "local_overlay_error",
+                    "reason": reason,
+                    "src": str(src),
+                    "dst": str(dst),
+                    "error": repr(e),
+                },
+            )
+
+    if applied:
+        # Hide overlay changes from git status so the agent doesn't try to auto-commit them.
+        try:
+            subprocess.run(
+                ["git", "update-index", "--skip-worktree", *applied],
+                cwd=str(REPO_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+            )
+        except Exception:
+            pass
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "type": "local_overlay_applied",
+                "reason": reason,
+                "files": applied,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +380,11 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         check=False,
         capture_output=True,
         text=True,
+        encoding='utf-8',
     )
     subprocess.run(["git", "reset", "--hard", remote_ref], cwd=str(REPO_DIR), check=True)
+    # Optional local overlay (development convenience)
+    _apply_local_overlay(reason=f"{reason}:{branch}")
     # Clean __pycache__ to prevent stale bytecode (git checkout may not update mtime)
     for p in REPO_DIR.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
@@ -322,7 +392,7 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
     st["current_branch"] = branch
     st["current_sha"] = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=str(REPO_DIR),
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, encoding='utf-8',
     ).stdout.strip()
     save_state(st)
     return True, "ok"
@@ -368,7 +438,7 @@ def import_test() -> Dict[str, Any]:
     r = subprocess.run(
         [sys.executable, "-c", "import ouroboros, ouroboros.agent; print('import_ok')"],
         cwd=str(REPO_DIR),
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding='utf-8',
     )
     return {"ok": (r.returncode == 0), "stdout": r.stdout, "stderr": r.stderr,
             "returncode": r.returncode}

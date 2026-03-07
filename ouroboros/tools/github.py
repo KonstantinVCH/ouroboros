@@ -27,6 +27,7 @@ def _gh_cmd(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
             text=True,
             timeout=timeout,
             input=input_data,
+            encoding='utf-8',
         )
         if res.returncode != 0:
             err = (res.stderr or "").strip()
@@ -50,6 +51,7 @@ def _get_repo_slug(ctx: ToolContext) -> str:
             capture_output=True,
             text=True,
             timeout=10,
+            encoding='utf-8',
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()

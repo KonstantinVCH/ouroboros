@@ -209,7 +209,7 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
         )
         new_sha = sp.run(
             ["git", "rev-parse", f"origin/{ctx.BRANCH_STABLE}"],
-            cwd=str(ctx.REPO_DIR), capture_output=True, text=True, check=True,
+            cwd=str(ctx.REPO_DIR), capture_output=True, text=True, check=True, encoding='utf-8',
         ).stdout.strip()
         st = ctx.load_state()
         if st.get("owner_chat_id"):
