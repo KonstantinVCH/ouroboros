@@ -8,7 +8,7 @@
 set -euo pipefail
 
 BOT_DIR="/c/Users/morco/repo/ouroboros"
-LOG_FILE="/tmp/ouroboros.log"
+LOG_FILE="$HOME/.ouroboros/Ouroboros/logs/bot.log"
 SUPERVISOR_LOG="$HOME/.ouroboros/Ouroboros/logs/supervisor.jsonl"
 PROXY="socks5://proxy_user:nmFZhByC9rNNOhz9@64.188.72.89:1080"
 TELEGRAM_TOKEN="8771685756:AAHLXdRVZiCLqKlT5COHcUa4fbWwpvli2wc"
@@ -34,8 +34,9 @@ kill_all_bot_processes() {
 
 start_bot() {
     log "Starting bot..."
+    mkdir -p "$(dirname "$LOG_FILE")"
     cd "$BOT_DIR"
-    nohup python local_launcher.py > "$LOG_FILE" 2>&1 &
+    nohup python local_launcher.py >> "$LOG_FILE" 2>&1 &
     log "Bot started with PID $!"
     sleep 5
 }
