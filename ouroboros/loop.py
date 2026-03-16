@@ -26,253 +26,17 @@ from ouroboros.utils import utc_now_iso, append_jsonl, truncate_for_log, sanitiz
 
 log = logging.getLogger(__name__)
 
-# -----------------------------
-# Zhipu fallback: text tool call protocol
-# -----------------------------
+# Text tool protocol helpers imported from text_tool_protocol module
+from ouroboros.text_tool_protocol import (
+    is_zhipu_model as _is_zhipu_model,
+    text_tool_protocol_enabled as _text_tool_protocol_enabled,
+    maybe_inject_text_tool_protocol as _maybe_inject_text_tool_protocol,
+    extract_tool_calls_from_text as _extract_tool_calls_from_text,
+    looks_like_misformatted_tool_use as _looks_like_misformatted_tool_use,
+)
 
-def _is_zhipu_model(model: str) -> bool:
-    m = str(model or "").strip().lower()
-    return m.startswith("zhipu/") or m.startswith("zhipuai/")
-
-
-def _text_tool_protocol_enabled(active_model: str) -> bool:
-    """
-    Enable a JSON-based tool call protocol for providers that don't return native tool_calls.
-
-    Controlled by env:
-      - OUROBOROS_TEXT_TOOL_PROTOCOL=off|0|false  -> disabled
-      - OUROBOROS_TEXT_TOOL_PROTOCOL=on|1|true    -> enabled
-      - OUROBOROS_TEXT_TOOL_PROTOCOL=auto         -> enabled only for Zhipu models
-    """
-    # Default OFF to avoid hardcoded behavior (Bible P3) unless explicitly enabled.
-    mode = str(os.environ.get("OUROBOROS_TEXT_TOOL_PROTOCOL", "off") or "").strip().lower()
-    if mode in {"0", "off", "false", "no"}:
-        return False
-    if mode in {"1", "on", "true", "yes"}:
-        return True
-    # default: auto
-    return _is_zhipu_model(active_model)
-
-
-def _maybe_inject_text_tool_protocol(messages: List[Dict[str, Any]], active_model: str) -> None:
-    """
-    If the active model doesn't support native OpenAI tool_calls (common for non-OpenAI endpoints),
-    we provide a JSON-based protocol so the model can still request tool execution.
-    """
-    if not _text_tool_protocol_enabled(active_model):
-        return
-
-    marker = "[TOOL_PROTOCOL_JSON_V1]"
-    for m in messages:
-        if m.get("role") == "system" and marker in str(m.get("content") or ""):
-            return
-
-    messages.append({
-        "role": "system",
-        "content": (
-            f"{marker}\n"
-            "You are running inside an agent loop with tools.\n"
-            "When the user asks anything that requires reading/modifying the repo, running commands, web searching, or checking state,\n"
-            "you MUST use tools (do not guess).\n\n"
-            "If you need to use tools, DO NOT describe the action in prose.\n"
-            "Instead, output ONLY a fenced JSON block in this exact shape:\n\n"
-            "```tool_calls\n"
-            "{\"tool_calls\": [{\"name\": \"repo_list\", \"arguments\": {}}]}\n"
-            "```\n\n"
-            "Rules:\n"
-            "- Use only tools that are available in the tool list.\n"
-            "- `arguments` must be a JSON object.\n"
-            "- When you output a tool_calls block, do not include any other text outside the block.\n"
-            "- If you do NOT need tools, respond normally.\n"
-        ),
-    })
-
-
-def _extract_tool_calls_from_text(text: Optional[str]) -> List[Dict[str, Any]]:
-    """
-    Parse JSON tool call protocol from model text.
-
-    Accepts blocks like:
-    ```tool_calls
-    {"tool_calls":[{"name":"repo_list","arguments":{}}]}
-    ```
-    """
-    if not text or not isinstance(text, str):
-        return []
-    t = text.strip()
-    if "```" not in t:
-        return []
-
-    blocks = t.split("```")
-    candidates: List[str] = []
-    for i in range(1, len(blocks), 2):
-        blk = blocks[i].strip()
-        if not blk:
-            continue
-        # Strip optional language tag first line
-        lines = blk.splitlines()
-        if len(lines) >= 2 and len(lines[0]) <= 24 and all(ch.isalnum() or ch in ("_", "-") for ch in lines[0].strip()):
-            lang = lines[0].strip().lower()
-            # Some models ignore the requested fence and wrap JSON as ```python.
-            if lang in ("json", "tool_calls", "tool", "tools", "python"):
-                blk = "\n".join(lines[1:]).strip()
-        candidates.append(blk)
-
-    for cand in candidates:
-        cand_s = cand.strip()
-        try:
-            obj = json.loads(cand_s)
-        except Exception:
-            # Best-effort repair for common JSON mistakes in tool_calls blocks
-            # (trailing commas like ",]" or ",}" or an extra comma after the last item).
-            try:
-                repaired = re.sub(r",\s*([\]}])", r"\1", cand_s)
-                obj = json.loads(repaired)
-            except Exception:
-                continue
-
-        tool_calls_raw = None
-        if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
-            tool_calls_raw = obj["tool_calls"]
-        elif isinstance(obj, dict) and isinstance(obj.get("tool"), str):
-            tool_calls_raw = [{"name": obj.get("tool"), "arguments": obj.get("arguments") or {}}]
-
-        if not tool_calls_raw:
-            continue
-
-        out: List[Dict[str, Any]] = []
-        for idx, tc in enumerate(tool_calls_raw):
-            if not isinstance(tc, dict):
-                continue
-            name = str(tc.get("name") or tc.get("tool") or "").strip()
-            args = tc.get("arguments", {})
-            if not name:
-                continue
-            try:
-                args_str = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
-            except Exception:
-                args_str = "{}"
-            out.append({
-                "id": str(tc.get("id") or f"text_tc_{idx}"),
-                "type": "function",
-                "function": {"name": name, "arguments": args_str},
-            })
-        if out:
-            return out
-
-    return []
-
-
-def _looks_like_misformatted_tool_use(text: Optional[str]) -> bool:
-    """Heuristic: model tried to run tools by printing code/thoughts instead of tool_calls JSON."""
-    if not text or not isinstance(text, str):
-        return False
-    t = text.lower()
-    # Common leakage patterns. Also treat "tool_calls" code fences as a tool attempt even without python/thought tags.
-    if (
-        "```python" not in t
-        and "<think" not in t
-        and "</think" not in t
-        and ("```" not in t or "tool_calls" not in t)
-    ):
-        return False
-
-    # If the model produced a tool_calls block (even malformed), that is a tool attempt.
-    if "tool_calls" in t and "```" in t:
-        return True
-    # Looks like tool invocations embedded in code / narration
-    needles = (
-        "drive_read(", "drive_write(", "drive_list(",
-        "repo_read(", "repo_list(", "repo_write(", "repo_edit(",
-        "shell(", "web_search(", "browse_page(", "browser_action(",
-        "switch_model(", "enable_tools(", "list_available_tools(",
-    )
-    return any(n in t for n in needles)
-
-# Pricing from OpenRouter API (2026-02-17). Update periodically via /api/v1/models.
-_MODEL_PRICING_STATIC = {
-    "anthropic/claude-opus-4.6": (5.0, 0.5, 25.0),
-    "anthropic/claude-opus-4": (15.0, 1.5, 75.0),
-    "anthropic/claude-sonnet-4": (3.0, 0.30, 15.0),
-    "anthropic/claude-sonnet-4.6": (3.0, 0.30, 15.0),
-    "anthropic/claude-sonnet-4.5": (3.0, 0.30, 15.0),
-    "openai/o3": (2.0, 0.50, 8.0),
-    "openai/o3-pro": (20.0, 1.0, 80.0),
-    "openai/o4-mini": (1.10, 0.275, 4.40),
-    "openai/gpt-4.1": (2.0, 0.50, 8.0),
-    "openai/gpt-5.2": (1.75, 0.175, 14.0),
-    "openai/gpt-5.2-codex": (1.75, 0.175, 14.0),
-    "google/gemini-2.5-pro-preview": (1.25, 0.125, 10.0),
-    "google/gemini-3-pro-preview": (2.0, 0.20, 12.0),
-    "x-ai/grok-3-mini": (0.30, 0.03, 0.50),
-    "qwen/qwen3.5-plus-02-15": (0.40, 0.04, 2.40),
-}
-
-_pricing_fetched = False
-_cached_pricing = None
-_pricing_lock = threading.Lock()
-
-def _get_pricing() -> Dict[str, Tuple[float, float, float]]:
-    """
-    Lazy-load pricing. On first call, attempts to fetch from OpenRouter API.
-    Falls back to static pricing if fetch fails.
-    Thread-safe via module-level lock.
-    """
-    global _pricing_fetched, _cached_pricing
-
-    # Fast path: already fetched (read without lock for performance)
-    if _pricing_fetched:
-        return _cached_pricing or _MODEL_PRICING_STATIC
-
-    # Slow path: fetch pricing (lock required)
-    with _pricing_lock:
-        # Double-check after acquiring lock (another thread may have fetched)
-        if _pricing_fetched:
-            return _cached_pricing or _MODEL_PRICING_STATIC
-
-        _pricing_fetched = True
-        _cached_pricing = dict(_MODEL_PRICING_STATIC)
-
-        try:
-            from ouroboros.llm import fetch_openrouter_pricing
-            _live = fetch_openrouter_pricing()
-            if _live and len(_live) > 5:
-                _cached_pricing.update(_live)
-        except Exception as e:
-            import logging as _log
-            _log.getLogger(__name__).warning("Failed to sync pricing from OpenRouter: %s", e)
-            # Reset flag so we retry next time
-            _pricing_fetched = False
-
-        return _cached_pricing
-
-def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int,
-                   cached_tokens: int = 0, cache_write_tokens: int = 0) -> float:
-    """Estimate cost from token counts using known pricing. Returns 0 if model unknown."""
-    model_pricing = _get_pricing()
-    # Try exact match first
-    pricing = model_pricing.get(model)
-    if not pricing:
-        # Try longest prefix match
-        best_match = None
-        best_length = 0
-        for key, val in model_pricing.items():
-            if model and model.startswith(key):
-                if len(key) > best_length:
-                    best_match = val
-                    best_length = len(key)
-        pricing = best_match
-    if not pricing:
-        return 0.0
-    input_price, cached_price, output_price = pricing
-    # Non-cached input tokens = prompt_tokens - cached_tokens
-    regular_input = max(0, prompt_tokens - cached_tokens)
-    cost = (
-        regular_input * input_price / 1_000_000
-        + cached_tokens * cached_price / 1_000_000
-        + completion_tokens * output_price / 1_000_000
-    )
-    return round(cost, 6)
+# Pricing helpers imported from pricing module
+from ouroboros.loop_pricing import get_pricing as _get_pricing, estimate_cost as _estimate_cost
 
 READ_ONLY_PARALLEL_TOOLS = frozenset({
     "repo_read", "repo_list",
@@ -296,199 +60,13 @@ def _truncate_tool_result(result: Any) -> str:
     return result_str[:15000] + f"\n... (truncated from {original_len} chars)"
 
 
-def _execute_single_tool(
-    tools: ToolRegistry,
-    tc: Dict[str, Any],
-    drive_logs: pathlib.Path,
-    task_id: str = "",
-) -> Dict[str, Any]:
-    """
-    Execute a single tool call and return all needed info.
-
-    Returns dict with: tool_call_id, fn_name, result, is_error, args_for_log, is_code_tool
-    """
-    fn_name = tc["function"]["name"]
-    tool_call_id = tc["id"]
-    is_code_tool = fn_name in tools.CODE_TOOLS
-
-    # Parse arguments
-    try:
-        args = json.loads(tc["function"]["arguments"] or "{}")
-    except (json.JSONDecodeError, ValueError) as e:
-        result = f"⚠️ TOOL_ARG_ERROR: Could not parse arguments for '{fn_name}': {e}"
-        return {
-            "tool_call_id": tool_call_id,
-            "fn_name": fn_name,
-            "result": result,
-            "is_error": True,
-            "args_for_log": {},
-            "is_code_tool": is_code_tool,
-        }
-
-    args_for_log = sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {})
-
-    # Execute tool
-    tool_ok = True
-    try:
-        result = tools.execute(fn_name, args)
-    except Exception as e:
-        tool_ok = False
-        result = f"⚠️ TOOL_ERROR ({fn_name}): {type(e).__name__}: {e}"
-        append_jsonl(drive_logs / "events.jsonl", {
-            "ts": utc_now_iso(), "type": "tool_error", "task_id": task_id,
-            "tool": fn_name, "args": args_for_log, "error": repr(e),
-        })
-
-    # Log tool execution (sanitize secrets from result before persisting)
-    append_jsonl(drive_logs / "tools.jsonl", {
-        "ts": utc_now_iso(), "tool": fn_name, "task_id": task_id,
-        "args": args_for_log,
-        "result_preview": sanitize_tool_result_for_log(truncate_for_log(result, 2000)),
-    })
-
-    is_error = (not tool_ok) or str(result).startswith("⚠️")
-
-    return {
-        "tool_call_id": tool_call_id,
-        "fn_name": fn_name,
-        "result": result,
-        "is_error": is_error,
-        "args_for_log": args_for_log,
-        "is_code_tool": is_code_tool,
-    }
-
-
-class _StatefulToolExecutor:
-    """
-    Thread-sticky executor for stateful tools (browser, etc).
-
-    Playwright sync API uses greenlet internally which has strict thread-affinity:
-    once a greenlet starts in a thread, all subsequent calls must happen in the same thread.
-    This executor ensures browse_page/browser_action always run in the same thread.
-
-    On timeout: we shutdown the executor and create a fresh one to reset state.
-    """
-    def __init__(self):
-        self._executor: Optional[ThreadPoolExecutor] = None
-
-    def submit(self, fn, *args, **kwargs):
-        """Submit work to the sticky thread. Creates executor on first call."""
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stateful_tool")
-        return self._executor.submit(fn, *args, **kwargs)
-
-    def reset(self):
-        """Shutdown current executor and create a fresh one. Used after timeout/error."""
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
-
-    def shutdown(self, wait=True, cancel_futures=False):
-        """Final cleanup."""
-        if self._executor is not None:
-            self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
-            self._executor = None
-
-
-def _make_timeout_result(
-    fn_name: str,
-    tool_call_id: str,
-    is_code_tool: bool,
-    tc: Dict[str, Any],
-    drive_logs: pathlib.Path,
-    timeout_sec: int,
-    task_id: str = "",
-    reset_msg: str = "",
-) -> Dict[str, Any]:
-    """
-    Create a timeout error result dictionary and log the timeout event.
-
-    Args:
-        reset_msg: Optional additional message (e.g., "Browser state has been reset. ")
-
-    Returns: Dict with tool_call_id, fn_name, result, is_error, args_for_log, is_code_tool
-    """
-    args_for_log = {}
-    try:
-        args = json.loads(tc["function"]["arguments"] or "{}")
-        args_for_log = sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {})
-    except Exception:
-        pass
-
-    result = (
-        f"⚠️ TOOL_TIMEOUT ({fn_name}): exceeded {timeout_sec}s limit. "
-        f"The tool is still running in background but control is returned to you. "
-        f"{reset_msg}Try a different approach or inform the owner{' about the issue' if not reset_msg else ''}."
-    )
-
-    append_jsonl(drive_logs / "events.jsonl", {
-        "ts": utc_now_iso(), "type": "tool_timeout",
-        "tool": fn_name, "args": args_for_log,
-        "timeout_sec": timeout_sec,
-    })
-    append_jsonl(drive_logs / "tools.jsonl", {
-        "ts": utc_now_iso(), "tool": fn_name,
-        "args": args_for_log, "result_preview": result,
-    })
-
-    return {
-        "tool_call_id": tool_call_id,
-        "fn_name": fn_name,
-        "result": result,
-        "is_error": True,
-        "args_for_log": args_for_log,
-        "is_code_tool": is_code_tool,
-    }
-
-
-def _execute_with_timeout(
-    tools: ToolRegistry,
-    tc: Dict[str, Any],
-    drive_logs: pathlib.Path,
-    timeout_sec: int,
-    task_id: str = "",
-    stateful_executor: Optional[_StatefulToolExecutor] = None,
-) -> Dict[str, Any]:
-    """
-    Execute a tool call with a hard timeout.
-
-    On timeout: returns TOOL_TIMEOUT error so the LLM regains control.
-    For stateful tools (browser): resets the sticky executor to recover state.
-    For regular tools: the hung worker thread leaks as daemon — watchdog handles recovery.
-    """
-    fn_name = tc["function"]["name"]
-    tool_call_id = tc["id"]
-    is_code_tool = fn_name in tools.CODE_TOOLS
-    use_stateful = stateful_executor and fn_name in STATEFUL_BROWSER_TOOLS
-
-    # Two distinct paths: stateful (thread-sticky) vs regular (per-call)
-    if use_stateful:
-        # Stateful executor: submit + wait, reset on timeout
-        future = stateful_executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
-        try:
-            return future.result(timeout=timeout_sec)
-        except TimeoutError:
-            stateful_executor.reset()
-            reset_msg = "Browser state has been reset. "
-            return _make_timeout_result(
-                fn_name, tool_call_id, is_code_tool, tc, drive_logs,
-                timeout_sec, task_id, reset_msg
-            )
-    else:
-        # Regular executor: explicit lifecycle to avoid shutdown(wait=True) deadlock
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            future = executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
-            try:
-                return future.result(timeout=timeout_sec)
-            except TimeoutError:
-                return _make_timeout_result(
-                    fn_name, tool_call_id, is_code_tool, tc, drive_logs,
-                    timeout_sec, task_id, reset_msg=""
-                )
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
+from ouroboros.loop_executor import (
+    execute_single_tool as _execute_single_tool,
+    StatefulToolExecutor as _StatefulToolExecutor,
+    make_timeout_result as _make_timeout_result,
+    execute_with_timeout as _execute_with_timeout,
+    STATEFUL_BROWSER_TOOLS,
+)
 
 def _handle_tool_calls(
     tool_calls: List[Dict[str, Any]],
@@ -754,7 +332,74 @@ def _drain_incoming_messages(
                     pass
 
 
+
+def _call_with_fallback(
+    llm, messages, active_model, tool_schemas, active_effort,
+    max_retries, drive_logs, task_id, round_idx,
+    event_queue, accumulated_usage, task_type, emit_progress,
+):
+    """Try primary model, fallback to alternative if it returns None."""
+    msg, cost = _call_llm_with_retry(
+        llm, messages, active_model, tool_schemas, active_effort,
+        max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type
+    )
+    if msg is not None:
+        return msg, False  # (msg, gave_up)
+
+    fallback_list_raw = os.environ.get(
+        "OUROBOROS_MODEL_FALLBACK_LIST",
+        "google/gemini-2.5-pro-preview,openai/o3,anthropic/claude-sonnet-4.6"
+    )
+    fallback_candidates = [m.strip() for m in fallback_list_raw.split(",") if m.strip()]
+    fallback_model = next((c for c in fallback_candidates if c != active_model), None)
+    if fallback_model is None:
+        return None, True
+
+    emit_progress(f"⚡ Fallback: {active_model} → {fallback_model}")
+    msg, _ = _call_llm_with_retry(
+        llm, messages, fallback_model, tool_schemas, active_effort,
+        max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type
+    )
+    return msg, (msg is None)  # (msg, gave_up)
+
+
+def _check_text_tool_format(
+    content, active_model, bad_tool_format_count, messages,
+    accumulated_usage, llm_trace, drive_logs, task_id, round_idx,
+):
+    """Handle misformatted tool calls from text-protocol models. Returns (action, value).
+    action: 'continue', 'return'
+    """
+    if not (_text_tool_protocol_enabled(active_model) and _looks_like_misformatted_tool_use(content)):
+        return 'continue', None
+
+    append_jsonl(drive_logs / "events.jsonl", {
+        "ts": utc_now_iso(),
+        "type": "llm_bad_tool_format",
+        "task_id": task_id,
+        "round": round_idx,
+        "model": active_model,
+        "count": bad_tool_format_count,
+        "preview": truncate_for_log(str(content or ""), 400),
+    })
+    if bad_tool_format_count <= 2:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Your previous message was NOT a valid tool invocation.\n"
+                "Do NOT output <think> blocks or ```python code.\n"
+                "If you need tools, output ONLY a ```tool_calls JSON block as specified.\n"
+                "Now retry with correct tool_calls output."
+            ),
+        })
+        return 'continue_retry', None
+    return 'return', (
+        "⚠️ Модель несколько раз подряд попыталась вызвать инструменты в неверном формате. "
+        "Попробуйте переформулировать запрос короче и явно попросить: «используй инструменты»."
+    )
+
 def run_llm_loop(
+
     messages: List[Dict[str, Any]],
     tools: ToolRegistry,
     llm: LLMClient,
@@ -869,42 +514,16 @@ def run_llm_loop(
 
             # Fallback to another model if primary model returns empty responses
             if msg is None:
-                # Configurable fallback priority list (Bible P3: no hardcoded behavior)
-                fallback_list_raw = os.environ.get(
-                    "OUROBOROS_MODEL_FALLBACK_LIST",
-                    "google/gemini-2.5-pro-preview,openai/o3,anthropic/claude-sonnet-4.6"
+                msg, gave_up = _call_with_fallback(
+                    llm, messages, active_model, tool_schemas, active_effort,
+                    max_retries, drive_logs, task_id, round_idx, event_queue,
+                    accumulated_usage, task_type, emit_progress,
                 )
-                fallback_candidates = [m.strip() for m in fallback_list_raw.split(",") if m.strip()]
-                fallback_model = None
-                for candidate in fallback_candidates:
-                    if candidate != active_model:
-                        fallback_model = candidate
-                        break
-                if fallback_model is None:
-                    return (
-                        f"⚠️ Failed to get a response from model {active_model} after {max_retries} attempts. "
-                        f"All fallback models match the active one. Try rephrasing your request."
-                    ), accumulated_usage, llm_trace
-
-                # Emit progress message so user sees fallback happening
-                fallback_progress = f"⚡ Fallback: {active_model} → {fallback_model}"
-                emit_progress(fallback_progress)
-
-                # Try fallback model (don't increment round_idx — this is still same logical round)
-                msg, fallback_cost = _call_llm_with_retry(
-                    llm, messages, fallback_model, tool_schemas, active_effort,
-                    max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type
-                )
-
-                # If fallback also fails, give up
-                if msg is None:
+                if gave_up or msg is None:
                     return (
                         f"⚠️ Failed to get a response from the model after {max_retries} attempts. "
-                        f"Fallback model ({fallback_model}) also returned no response."
+                        f"Fallback model also returned no response."
                     ), accumulated_usage, llm_trace
-
-                # Fallback succeeded — continue processing with this msg
-                # (don't return — fall through to tool_calls processing below)
 
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
@@ -920,35 +539,16 @@ def run_llm_loop(
 
             # No tool calls — final response
             if not tool_calls:
-                # If text tool protocol is enabled and the model "leaks" code/thoughts instead of tool_calls,
-                # ask it to correct output format without sending the garbage to the user.
                 if _text_tool_protocol_enabled(active_model) and _looks_like_misformatted_tool_use(content):
                     bad_tool_format_count += 1
-                    append_jsonl(drive_logs / "events.jsonl", {
-                        "ts": utc_now_iso(),
-                        "type": "llm_bad_tool_format",
-                        "task_id": task_id,
-                        "round": round_idx,
-                        "model": active_model,
-                        "count": bad_tool_format_count,
-                        "preview": truncate_for_log(str(content or ""), 400),
-                    })
-                    if bad_tool_format_count <= 2:
-                        messages.append({
-                            "role": "system",
-                            "content": (
-                                "Your previous message was NOT a valid tool invocation.\n"
-                                "Do NOT output <think> blocks or ```python code.\n"
-                                "If you need tools, output ONLY a ```tool_calls JSON block as specified.\n"
-                                "Now retry with correct tool_calls output."
-                            ),
-                        })
+                    action, val = _check_text_tool_format(
+                        content, active_model, bad_tool_format_count, messages,
+                        accumulated_usage, llm_trace, drive_logs, task_id, round_idx,
+                    )
+                    if action == 'continue_retry':
                         continue
-                    return (
-                        "⚠️ Модель несколько раз подряд попыталась вызвать инструменты в неверном формате. "
-                        "Попробуйте переформулировать запрос короче и явно попросить: «используй инструменты»."
-                    ), accumulated_usage, llm_trace
-
+                    if action == 'return':
+                        return val, accumulated_usage, llm_trace
                 return _handle_text_response(content, llm_trace, accumulated_usage)
 
             # Process tool calls
