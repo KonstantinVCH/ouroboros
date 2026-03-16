@@ -2,7 +2,7 @@
 watchdog.py — Ouroboros bot watchdog
 
 Проверяет:
-  1. Доступность прокси / Telegram API
+  1. Доступность прокси / Telegram API (и авто-чинит если контейнер упал)
   2. Количество запущенных экземпляров бота
   3. Ошибки 409 Conflict и частые poll-ошибки в логах
   4. Автоматически убивает дубли и перезапускает бот
@@ -33,6 +33,12 @@ SUPERVISOR_LOG = pathlib.Path.home() / ".ouroboros" / "Ouroboros" / "logs" / "su
 
 PROXY = "socks5://proxy_user:nmFZhByC9rNNOhz9@64.188.72.89:1080"
 TELEGRAM_TOKEN = "8771685756:AAHLXdRVZiCLqKlT5COHcUa4fbWwpvli2wc"
+
+# SSH-параметры прокси-сервера для авто-починки
+PROXY_SSH_HOST = "64.188.72.89"
+PROXY_SSH_USER = "root"
+PROXY_SSH_PASS = "6NH8EGE073Rb"
+PROXY_CONTAINER = "amnezia-socks5proxy"
 
 CHECK_INTERVAL_SEC = 60
 RECENT_MINUTES = 2          # считать ошибки "свежими" если не старше 2 минут
@@ -141,7 +147,7 @@ def _start_bot() -> int:
     proc = subprocess.Popen(
         [PYTHON_EXE, "local_launcher.py"],
         cwd=str(BOT_DIR),
-        stdout=open(LOG_FILE, "a"),
+        stdout=open(LOG_FILE, "a", encoding="utf-8"),
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
@@ -157,6 +163,46 @@ def _cooldown_active() -> bool:
         log(f"Cooldown active ({remaining}s remaining after last restart) — skipping restart")
         return True
     return False
+
+
+# ── авто-починка прокси ───────────────────────────────────────────────────────
+
+def _repair_proxy() -> bool:
+    """
+    Пытается починить прокси: подключается по SSH к серверу и перезапускает
+    Docker-контейнер. Возвращает True если после починки прокси заработал.
+    """
+    log(f"Attempting proxy repair: SSH to {PROXY_SSH_HOST}, restarting {PROXY_CONTAINER}...")
+    try:
+        # sshpass нужен для передачи пароля; если нет — используем ключ
+        ssh_cmd_prefix = []
+        try:
+            subprocess.run(["sshpass", "-V"], capture_output=True, check=True)
+            ssh_cmd_prefix = ["sshpass", f"-p{PROXY_SSH_PASS}"]
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass  # используем ssh без пароля (ключ уже добавлен)
+
+        cmd = ssh_cmd_prefix + [
+            "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+            f"{PROXY_SSH_USER}@{PROXY_SSH_HOST}",
+            f"docker start {PROXY_CONTAINER} && docker update --restart unless-stopped {PROXY_CONTAINER}",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            log("SSH repair command OK — waiting 5s for container to start...")
+            time.sleep(5)
+            if check_proxy():
+                log("Proxy is UP after repair.")
+                return True
+            else:
+                log("Proxy still DOWN after repair attempt.")
+                return False
+        else:
+            log(f"SSH repair failed (exit {result.returncode}): {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        log(f"Proxy repair error: {e}")
+        return False
 
 
 # ── проверка прокси ───────────────────────────────────────────────────────────
@@ -259,7 +305,10 @@ def run_check() -> None:
     if proxy_ok:
         log("Proxy OK — Telegram API reachable")
     else:
-        log("WARNING: Proxy unavailable or Telegram unreachable")
+        log("WARNING: Proxy unavailable — attempting auto-repair...")
+        proxy_ok = _repair_proxy()
+        if not proxy_ok:
+            log("Proxy still unavailable after repair attempt")
 
     # 2. Процессы
     pids = _find_bot_processes()
