@@ -13,6 +13,8 @@ import pathlib
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.cost import estimate_cost
+
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
@@ -503,13 +505,22 @@ class LLMClient:
         if tool_calls:
             msg["tool_calls"] = tool_calls
 
+        _cached_tok = getattr(resp.usage, "cache_read_input_tokens", 0) or 0
+        _write_tok = getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+        _cost = estimate_cost(
+            model=model,
+            prompt_tokens=resp.usage.input_tokens,
+            completion_tokens=resp.usage.output_tokens,
+            cached_tokens=_cached_tok,
+            cache_write_tokens=_write_tok,
+        )
         usage: Dict[str, Any] = {
             "prompt_tokens": resp.usage.input_tokens,
             "completion_tokens": resp.usage.output_tokens,
             "total_tokens": resp.usage.input_tokens + resp.usage.output_tokens,
-            "cached_tokens": getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
-            "cache_write_tokens": getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
-            "cost": 0.0,
+            "cached_tokens": _cached_tok,
+            "cache_write_tokens": _write_tok,
+            "cost": _cost,
         }
         return msg, usage
 

@@ -70,6 +70,30 @@ def get_pricing() -> Dict[str, Tuple[float, float, float]]:
         return _cached_pricing
 
 
+def _normalize_model(model: str) -> str:
+    """Normalize model name for pricing lookup.
+    
+    Anthropic direct API returns names like 'claude-sonnet-4-6' or
+    'claude-3-5-sonnet-20241022'. OpenRouter uses 'anthropic/claude-sonnet-4.6'.
+    This tries to match both forms.
+    """
+    if not model:
+        return model
+    # Already has provider prefix → return as-is
+    if "/" in model:
+        return model
+    # Try to guess provider from model name
+    if model.startswith("claude"):
+        return f"anthropic/{model}"
+    if model.startswith("gpt") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
+        return f"openai/{model}"
+    if model.startswith("gemini"):
+        return f"google/{model}"
+    if model.startswith("grok"):
+        return f"x-ai/{model}"
+    return model
+
+
 def estimate_cost(
     model: str,
     prompt_tokens: int,
@@ -79,6 +103,9 @@ def estimate_cost(
 ) -> float:
     """Estimate cost from token counts using known pricing. Returns 0 if model unknown."""
     model_pricing = get_pricing()
+
+    # Normalize model name (handle Anthropic direct API names like 'claude-sonnet-4-6')
+    model = _normalize_model(model)
 
     # Try exact match first
     pricing = model_pricing.get(model)
